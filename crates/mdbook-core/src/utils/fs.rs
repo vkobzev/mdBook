@@ -1,6 +1,7 @@
 //! Filesystem utilities and helpers.
 
 use anyhow::{Context, Result};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use tracing::debug;
@@ -97,11 +98,29 @@ pub fn copy_files_except_ext(
     avoid_dir: Option<&PathBuf>,
     ext_blacklist: &[&str],
 ) -> Result<()> {
+    let mut builder = GitignoreBuilder::new(from);
+    for ext in ext_blacklist {
+        builder.add_line(None, &format!("*.{ext}"))?;
+    }
+    let ignore = builder.build()?;
+
+    copy_files_except_ignored(from, to, recursive, avoid_dir, Some(&ignore))
+}
+
+/// Copies all files of a directory to another one except the files that are
+/// ignored by the passed [`Gitignore`].
+pub fn copy_files_except_ignored(
+    from: &Path,
+    to: &Path,
+    recursive: bool,
+    avoid_dir: Option<&PathBuf>,
+    ignore: Option<&Gitignore>,
+) -> Result<()> {
     debug!(
         "Copying all files from {} to {} (blacklist: {:?}), avoiding {:?}",
         from.display(),
         to.display(),
-        ext_blacklist,
+        ignore,
         avoid_dir
     );
 
@@ -118,6 +137,14 @@ pub fn copy_files_except_ext(
 
         let entry_file_name = entry.file_name().unwrap();
         let target_file_path = to.join(entry_file_name);
+
+        // Check if it is ignored
+        if let Some(ignore) = ignore {
+            let path = entry.as_path();
+            if ignore.matched(path, path.is_dir()).is_ignore() {
+                continue;
+            }
+        }
 
         // If the entry is a dir and the recursive option is enabled, call itself
         if metadata.is_dir() && recursive {
@@ -136,14 +163,8 @@ pub fn copy_files_except_ext(
                 fs::create_dir(&target_file_path)?;
             }
 
-            copy_files_except_ext(&entry, &target_file_path, true, avoid_dir, ext_blacklist)?;
+            copy_files_except_ignored(&entry, &target_file_path, true, avoid_dir, ignore)?;
         } else if metadata.is_file() {
-            // Check if it is in the blacklist
-            if let Some(ext) = entry.extension() {
-                if ext_blacklist.contains(&ext.to_str().unwrap()) {
-                    continue;
-                }
-            }
             debug!("Copying {entry:?} to {target_file_path:?}");
             copy(&entry, &target_file_path)?;
         }
@@ -268,6 +289,58 @@ mod tests {
         }
         if !tmp.path().join("output/symlink.png").exists() {
             panic!("output/symlink.png should exist")
+        }
+    }
+
+    #[test]
+    fn copy_files_except_ignored_test() {
+        let tmp = match tempfile::TempDir::new() {
+            Ok(t) => t,
+            Err(e) => panic!("Could not create a temp dir: {e}"),
+        };
+
+        // Create a couple of files and directories
+        write(tmp.path().join("file.txt"), "").unwrap();
+        write(tmp.path().join("file.md"), "").unwrap();
+        write(tmp.path().join("file.png"), "").unwrap();
+        write(tmp.path().join("ignored_file"), "").unwrap();
+        write(tmp.path().join("ignored_dir/inside.txt"), "").unwrap();
+
+        // Build an ignore matcher that ignores `*.md`, `ignored_file` and `ignored_dir`
+        let mut builder = GitignoreBuilder::new(tmp.path());
+        builder.add_line(None, "*.md").unwrap();
+        builder.add_line(None, "ignored_file").unwrap();
+        builder.add_line(None, "ignored_dir").unwrap();
+        let ignore = builder.build().unwrap();
+
+        // Create output dir
+        create_dir_all(tmp.path().join("output")).unwrap();
+
+        if let Err(e) = copy_files_except_ignored(
+            tmp.path(),
+            &tmp.path().join("output"),
+            true,
+            None,
+            Some(&ignore),
+        ) {
+            panic!("Error while executing the function:\n{e:?}");
+        }
+
+        // Check if the correct files were created
+        if !tmp.path().join("output/file.txt").exists() {
+            panic!("output/file.txt should exist")
+        }
+        if tmp.path().join("output/file.md").exists() {
+            panic!("output/file.md should not exist")
+        }
+        if !tmp.path().join("output/file.png").exists() {
+            panic!("output/file.png should exist")
+        }
+        if tmp.path().join("output/ignored_file").exists() {
+            panic!("output/ignored_file should not exist")
+        }
+        if tmp.path().join("output/ignored_dir").exists() {
+            panic!("output/ignored_dir should not exist")
         }
     }
 }

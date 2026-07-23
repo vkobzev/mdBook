@@ -1,0 +1,197 @@
+diff --git c/crates/mdbook-core/Cargo.toml w/crates/mdbook-core/Cargo.toml
+index b17766e9..544f4603 100644
+--- c/crates/mdbook-core/Cargo.toml
++++ w/crates/mdbook-core/Cargo.toml
+@@ -9,6 +9,7 @@ rust-version.workspace = true
+ 
+ [dependencies]
+ anyhow.workspace = true
++ignore.workspace = true
+ regex.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+diff --git c/crates/mdbook-core/src/utils/fs.rs w/crates/mdbook-core/src/utils/fs.rs
+index 2e61d87d..d0cb2048 100644
+--- c/crates/mdbook-core/src/utils/fs.rs
++++ w/crates/mdbook-core/src/utils/fs.rs
+@@ -1,6 +1,7 @@
+ //! Filesystem utilities and helpers.
+ 
+ use anyhow::{Context, Result};
++use ignore::gitignore::{Gitignore, GitignoreBuilder};
+ use std::fs;
+ use std::path::{Component, Path, PathBuf};
+ use tracing::debug;
+@@ -96,12 +97,30 @@ pub fn copy_files_except_ext(
+     recursive: bool,
+     avoid_dir: Option<&PathBuf>,
+     ext_blacklist: &[&str],
++) -> Result<()> {
++    let mut builder = GitignoreBuilder::new(from);
++    for ext in ext_blacklist {
++        builder.add_line(None, &format!("*.{ext}"))?;
++    }
++    let ignore = builder.build()?;
++
++    copy_files_except_ignored(from, to, recursive, avoid_dir, Some(&ignore))
++}
++
++/// Copies all files of a directory to another one except the files that are
++/// ignored by the passed [`Gitignore`].
++pub fn copy_files_except_ignored(
++    from: &Path,
++    to: &Path,
++    recursive: bool,
++    avoid_dir: Option<&PathBuf>,
++    ignore: Option<&Gitignore>,
+ ) -> Result<()> {
+     debug!(
+         "Copying all files from {} to {} (blacklist: {:?}), avoiding {:?}",
+         from.display(),
+         to.display(),
+-        ext_blacklist,
++        ignore,
+         avoid_dir
+     );
+ 
+@@ -119,6 +138,14 @@ pub fn copy_files_except_ext(
+         let entry_file_name = entry.file_name().unwrap();
+         let target_file_path = to.join(entry_file_name);
+ 
++        // Check if it is ignored
++        if let Some(ignore) = ignore {
++            let path = entry.as_path();
++            if ignore.matched(path, path.is_dir()).is_ignore() {
++                continue;
++            }
++        }
++
+         // If the entry is a dir and the recursive option is enabled, call itself
+         if metadata.is_dir() && recursive {
+             if entry == to.as_os_str() {
+@@ -136,14 +163,8 @@ pub fn copy_files_except_ext(
+                 fs::create_dir(&target_file_path)?;
+             }
+ 
+-            copy_files_except_ext(&entry, &target_file_path, true, avoid_dir, ext_blacklist)?;
++            copy_files_except_ignored(&entry, &target_file_path, true, avoid_dir, ignore)?;
+         } else if metadata.is_file() {
+-            // Check if it is in the blacklist
+-            if let Some(ext) = entry.extension() {
+-                if ext_blacklist.contains(&ext.to_str().unwrap()) {
+-                    continue;
+-                }
+-            }
+             debug!("Copying {entry:?} to {target_file_path:?}");
+             copy(&entry, &target_file_path)?;
+         }
+@@ -270,4 +291,56 @@ mod tests {
+             panic!("output/symlink.png should exist")
+         }
+     }
++
++    #[test]
++    fn copy_files_except_ignored_test() {
++        let tmp = match tempfile::TempDir::new() {
++            Ok(t) => t,
++            Err(e) => panic!("Could not create a temp dir: {e}"),
++        };
++
++        // Create a couple of files and directories
++        write(tmp.path().join("file.txt"), "").unwrap();
++        write(tmp.path().join("file.md"), "").unwrap();
++        write(tmp.path().join("file.png"), "").unwrap();
++        write(tmp.path().join("ignored_file"), "").unwrap();
++        write(tmp.path().join("ignored_dir/inside.txt"), "").unwrap();
++
++        // Build an ignore matcher that ignores `*.md`, `ignored_file` and `ignored_dir`
++        let mut builder = GitignoreBuilder::new(tmp.path());
++        builder.add_line(None, "*.md").unwrap();
++        builder.add_line(None, "ignored_file").unwrap();
++        builder.add_line(None, "ignored_dir").unwrap();
++        let ignore = builder.build().unwrap();
++
++        // Create output dir
++        create_dir_all(tmp.path().join("output")).unwrap();
++
++        if let Err(e) = copy_files_except_ignored(
++            tmp.path(),
++            &tmp.path().join("output"),
++            true,
++            None,
++            Some(&ignore),
++        ) {
++            panic!("Error while executing the function:\n{e:?}");
++        }
++
++        // Check if the correct files were created
++        if !tmp.path().join("output/file.txt").exists() {
++            panic!("output/file.txt should exist")
++        }
++        if tmp.path().join("output/file.md").exists() {
++            panic!("output/file.md should not exist")
++        }
++        if !tmp.path().join("output/file.png").exists() {
++            panic!("output/file.png should exist")
++        }
++        if tmp.path().join("output/ignored_file").exists() {
++            panic!("output/ignored_file should not exist")
++        }
++        if tmp.path().join("output/ignored_dir").exists() {
++            panic!("output/ignored_dir should not exist")
++        }
++    }
+ }
+diff --git c/crates/mdbook-html/Cargo.toml w/crates/mdbook-html/Cargo.toml
+index f04d3acb..b3625541 100644
+--- c/crates/mdbook-html/Cargo.toml
++++ w/crates/mdbook-html/Cargo.toml
+@@ -15,6 +15,7 @@ font-awesome-as-a-crate.workspace = true
+ handlebars.workspace = true
+ hex.workspace = true
+ html5ever.workspace = true
++ignore.workspace = true
+ indexmap.workspace = true
+ mdbook-core.workspace = true
+ mdbook-markdown.workspace = true
+diff --git c/crates/mdbook-html/src/html_handlebars/hbs_renderer.rs w/crates/mdbook-html/src/html_handlebars/hbs_renderer.rs
+index 8edac3ca..18a1b59f 100644
+--- c/crates/mdbook-html/src/html_handlebars/hbs_renderer.rs
++++ w/crates/mdbook-html/src/html_handlebars/hbs_renderer.rs
+@@ -6,6 +6,7 @@ use crate::theme::Theme;
+ use crate::utils::ToUrlPath;
+ use anyhow::{Context, Result, bail};
+ use handlebars::Handlebars;
++use ignore::gitignore::GitignoreBuilder;
+ use mdbook_core::book::{Book, BookItem, Chapter};
+ use mdbook_core::config::{BookConfig, Config, HtmlConfig};
+ use mdbook_core::utils::fs;
+@@ -443,8 +444,26 @@ impl Renderer for HtmlHandlebars {
+         self.emit_redirects(&ctx.destination, &handlebars, &html_config.redirect)
+             .context("Unable to emit redirects")?;
+ 
+-        // Copy all remaining files, avoid a recursive copy from/to the book build dir
+-        fs::copy_files_except_ext(&src_dir, destination, true, Some(&build_dir), &["md"])?;
++        // Copy all remaining files, avoid a recursive copy from/to the book build dir.
++        // Files matched by a `.mdbookignore` (gitignore syntax) are skipped, as are
++        // the markdown files which have already been rendered to HTML.
++        let mut builder = GitignoreBuilder::new(&src_dir);
++        let mdbook_ignore = src_dir.join(".mdbookignore");
++        if mdbook_ignore.exists() {
++            if let Some(err) = builder.add(mdbook_ignore) {
++                warn!("Unable to load '.mdbookignore' file: {}", err);
++            }
++        }
++        builder.add_line(None, "*.md")?;
++        let ignore = builder.build()?;
++
++        fs::copy_files_except_ignored(
++            &src_dir,
++            destination,
++            true,
++            Some(&build_dir),
++            Some(&ignore),
++        )?;
+ 
+         info!("HTML book written to `{}`", destination.display());
+ 
